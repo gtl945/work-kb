@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WorkKB 打包使用手册</title>
+<style>
+  :root { --brand: #6464f0; --bg: #f7f8fc; --code-bg: #1e2a3a; --border: #e2e8f0; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: #2d3748; line-height: 1.7; }
+  .container { max-width: 880px; margin: 0 auto; padding: 40px 24px; }
+  h1 { font-size: 28px; color: var(--brand); margin-bottom: 8px; }
+  .subtitle { color: #718096; font-size: 15px; margin-bottom: 32px; }
+  h2 { font-size: 20px; color: #1a202c; margin: 36px 0 12px; padding-left: 12px; border-left: 4px solid var(--brand); }
+  h3 { font-size: 16px; color: #2d3748; margin: 20px 0 8px; }
+  p { margin-bottom: 10px; }
+  .card { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+  .card.warning { border-color: #fbd38d; background: #fffbeb; }
+  .card.tip { border-color: #90cdf4; background: #ebf8ff; }
+  .card.success { border-color: #9ae6b4; background: #f0fff4; }
+  ul, ol { margin: 8px 0 8px 24px; }
+  li { margin-bottom: 6px; }
+  code { background: #edf2f7; padding: 2px 6px; border-radius: 4px; font-family: "Cascadia Code", "Consolas", monospace; font-size: 14px; }
+  pre { background: var(--code-bg); color: #e2e8f0; padding: 16px; border-radius: 8px; overflow-x: auto; margin: 12px 0; font-size: 14px; line-height: 1.5; }
+  pre code { background: none; padding: 0; color: inherit; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; font-size: 14px; }
+  th { background: #edf2f7; font-weight: 600; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  .badge-required { background: #fed7d7; color: #c53030; }
+  .badge-optional { background: #bee3f8; color: #2c5282; }
+  .badge-bundled { background: #c6f6d5; color: #276749; }
+  .step-num { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; background: var(--brand); color: #fff; border-radius: 50%; font-size: 14px; font-weight: 700; margin-right: 8px; vertical-align: middle; }
+  .divider { height: 1px; background: var(--border); margin: 32px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>WorkKB 打包使用手册</h1>
+<p class="subtitle">将个人工作知识库桌面应用打包为 Windows EXE 安装包的完整指南</p>
+
+<!-- ===== 概述 ===== -->
+<h2>概述</h2>
+<div class="card">
+<p>WorkKB 是基于 Tauri 2 的桌面应用，由 <strong>Rust 后端 + Vue 前端 + Python sidecar</strong> 三部分组成。打包时需要将三部分分别编译并合并为最终安装包。</p>
+<p>打包后的安装包对终端用户<strong>零依赖</strong>——用户只需 Windows 10/11，无需安装 Python、Rust 或 Node.js。</p>
+</div>
+
+<!-- ===== 环境要求 ===== -->
+<h2>一、打包环境要求</h2>
+<p>以下软件需安装在<strong>打包者</strong>的机器上（终端用户不需要）：</p>
+<table>
+<tr><th>软件</th><th>版本要求</th><th>用途</th><th>下载地址</th></tr>
+<tr><td>Node.js</td><td>18+</td><td>前端构建 + Tauri CLI</td><td>nodejs.org</td></tr>
+<tr><td>Rust</td><td>稳定版</td><td>编译 Rust 后端</td><td>rustup.rs</td></tr>
+<tr><td>MSVC Build Tools</td><td>VS 2022</td><td>C/C++ 链接器（Rust 依赖）</td><td>Visual Studio 下载页</td></tr>
+<tr><td>Python</td><td>3.10+</td><td>打包 sidecar（PyInstaller）</td><td>python.org</td></tr>
+</table>
+
+<div class="card tip">
+<p><strong>提示</strong>：Rust 和 MSVC 只需在打包机器上安装。安装 Rust 时选择默认选项即可，MSVC Build Tools 需勾选「使用 C++ 的桌面开发」工作负载。</p>
+</div>
+
+<!-- ===== 一键打包 ===== -->
+<h2>二、一键打包（推荐）</h2>
+<p>项目根目录已提供 <code>build.bat</code> 脚本，双击或在终端运行即可：</p>
+<pre><code>cd "d:\Trae CN\project1\work-kb"
+build.bat</code></pre>
+<p>脚本自动完成以下 5 个步骤：</p>
+<ol>
+<li><span class="step-num">1</span>安装 Python 依赖（python-docx / openpyxl / python-pptx / pyinstaller）</li>
+<li><span class="step-num">2</span>用 PyInstaller 将 sidecar 打包为独立 <code>parse_server.exe</code></li>
+<li><span class="step-num">3</span>安装前端 npm 依赖</li>
+<li><span class="step-num">4</span>执行 <code>tauri build</code> 编译 Rust 后端（release 模式）</li>
+<li><span class="step-num">5</span>将 sidecar 复制到发布目录</li>
+</ol>
+<p>整个过程约 5–15 分钟，取决于机器性能。</p>
+
+<!-- ===== 手动打包 ===== -->
+<h2>三、手动打包步骤</h2>
+<p>如需手动执行或排查问题，按以下步骤操作：</p>
+
+<h3><span class="step-num">1</span>安装 Python 依赖</h3>
+<pre><code>pip install -r src-tauri\sidecar\requirements.txt pyinstaller</code></pre>
+
+<h3><span class="step-num">2</span>用 PyInstaller 打包 sidecar</h3>
+<pre><code>cd src-tauri\sidecar
+pyinstaller --onefile --name parse_server --noconfirm parse_server.py
+copy dist\parse_server.exe .
+rmdir /s /q dist build
+del parse_server.spec
+cd ..\..</code></pre>
+<div class="card tip">
+<p><strong>说明</strong>：<code>--onefile</code> 将 Python 运行时 + 三个解析库全部打包进单个 exe，终端无需安装 Python。该 exe 通过 stdin/stdout 进行 JSON-RPC 通信，无需弹窗。</p>
+</div>
+
+<h3><span class="step-num">3</span>安装前端依赖</h3>
+<pre><code>npm install</code></pre>
+
+<h3><span class="step-num">4</span>执行 Tauri 构建</h3>
+<pre><code>npm run tauri build</code></pre>
+<p>此命令会依次执行：</p>
+<ul>
+<li><code>npm run build</code> — 构建前端（输出到 <code>dist/</code>）</li>
+<li><code>cargo build --release</code> — 编译 Rust 后端（输出到 <code>src-tauri/target/release/</code>）</li>
+<li>生成 NSIS 安装包（.exe）和 MSI 安装包（.msi）</li>
+</ul>
+
+<h3><span class="step-num">5</span>复制 sidecar 到发布目录</h3>
+<pre><code>mkdir src-tauri\target\release\sidecar 2>nul
+copy src-tauri\sidecar\parse_server.exe src-tauri\target\release\sidecar\</code></pre>
+<p>程序运行时会在自身目录下查找 <code>sidecar\parse_server.exe</code>，因此必须将此文件放在主程序同级目录。</p>
+
+<!-- ===== 产物说明 ===== -->
+<h2>四、构建产物说明</h2>
+<table>
+<tr><th>文件</th><th>路径</th><th>说明</th></tr>
+<tr><td>主程序</td><td><code>src-tauri\target\release\work-kb.exe</code></td><td>独立可执行的桌面应用</td></tr>
+<tr><td>Sidecar</td><td><code>src-tauri\target\release\sidecar\parse_server.exe</code></td><td>Office 文件解析引擎</td></tr>
+<tr><td>NSIS 安装包</td><td><code>src-tauri\target\release\bundle\nsis\work-kb_0.1.0_x64-setup.exe</code></td><td>推荐分发格式，安装向导友好</td></tr>
+<tr><td>MSI 安装包</td><td><code>src-tauri\target\release\bundle\msi\work-kb_0.1.0_x64_en-US.msi</code></td><td>企业部署用格式</td></tr>
+</table>
+
+<!-- ===== 分发方式 ===== -->
+<h2>五、分发方式</h2>
+
+<div class="card success">
+<h3>方式一：安装包分发（推荐）</h3>
+<p>将 <strong>NSIS setup.exe</strong> 发给用户，用户双击安装即可。安装后程序自动出现在开始菜单。</p>
+<p><strong>注意</strong>：需手动将 <code>sidecar\parse_server.exe</code> 复制到安装目录（通常为 <code>C:\Program Files\WorkKB\sidecar\</code>）。</p>
+</div>
+
+<div class="card success">
+<h3>方式二：绿色版分发</h3>
+<p>将以下两个文件打包为 zip 发给用户：</p>
+<pre><code>work-kb.exe
+sidecar\parse_server.exe</code></pre>
+<p>用户解压后直接双击 <code>work-kb.exe</code> 运行，无需安装。目录结构：</p>
+<pre><code>WorkKB/
+├── work-kb.exe
+└── sidecar/
+    └── parse_server.exe</code></pre>
+</div>
+
+<!-- ===== 终端用户要求 ===== -->
+<h2>六、终端用户要求</h2>
+<table>
+<tr><th>项目</th><th>要求</th><th>说明</th></tr>
+<tr><td>操作系统</td><td>Windows 10 / 11 (64位)</td><td>不支持 Windows 7</td></tr>
+<tr><td>WebView2</td><td>需预装</td><td>Win10 2004+ / Win11 已自带；旧版 Win10 可能需手动安装</td></tr>
+<tr><td>Python</td><td>不需要</td><td><span class="badge badge-bundled">已内置</span> PyInstaller 打包进 exe</td></tr>
+<tr><td>Rust / Node.js</td><td>不需要</td><td><span class="badge badge-bundled">已编译</span> Rust 编译为原生机器码</td></tr>
+</table>
+
+<!-- ===== 常见问题 ===== -->
+<h2>七、常见问题</h2>
+
+<h3>Q: 安装后打开 Office 文件报错「启动 sidecar 失败」</h3>
+<p><strong>A</strong>: 检查安装目录下是否存在 <code>sidecar\parse_server.exe</code>。如果没有，从打包机器的 <code>src-tauri\sidecar\parse_server.exe</code> 复制过去。</p>
+
+<h3>Q: 打包时报错「link.exe not found」</h3>
+<p><strong>A</strong>: MSVC Build Tools 未安装或未勾选 C++ 工作负载。重新安装 VS Build Tools，勾选「使用 C++ 的桌面开发」。</p>
+
+<h3>Q: PyInstaller 打包出的 exe 被杀毒软件误报</h3>
+<p><strong>A</strong>: 这是 PyInstaller 的常见问题（打包行为类似病毒注入）。可将被报毒的 <code>parse_server.exe</code> 加入杀毒软件白名单，或使用代码签名证书对 exe 进行签名。</p>
+
+<h3>Q: PDF 能解析但 Word/Excel/PPT 不能</h3>
+<p><strong>A</strong>: PDF 由 Rust 原生解析（无需 sidecar），Office 文件由 Python sidecar 解析。如果 sidecar 缺失或损坏，只有 PDF 能正常工作。请确认 <code>sidecar\parse_server.exe</code> 存在且可运行。</p>
+
+<h3>Q: 如何修改应用图标</h3>
+<p><strong>A</strong>: 准备一张 512x512 的 PNG 图片，执行 <code>npx tauri icon 你的图标.png</code>，会自动生成所有尺寸的图标文件覆盖到 <code>src-tauri/icons/</code>。</p>
+
+<div class="divider"></div>
+
+<p style="text-align:center; color:#a0aec0; font-size:13px;">WorkKB v0.1.0 · 个人工作知识库 · 2026</p>
+
+</div>
+</body>
+</html>
