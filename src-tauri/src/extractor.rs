@@ -23,6 +23,8 @@ pub struct DraftItem {
     pub evidence_type: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub is_fallback: bool,
 }
 
 fn body_date_regex() -> &'static Regex {
@@ -64,7 +66,7 @@ fn extract_body_date(text: &str) -> Option<String> {
 }
 
 /// 从文件名抽日期（20260829 / 2026_08_29 / 2026-08-29）。
-fn extract_fname_date(path: &str) -> Option<String> {
+pub fn extract_fname_date(path: &str) -> Option<String> {
     let stem = Path::new(path).file_stem()?.to_str()?;
     let c = fname_date_regex().captures(stem)?;
     let y = c.get(1)?.as_str().parse::<u32>().ok()?;
@@ -129,7 +131,34 @@ pub fn chunk_and_extract(
                 source_file_id,
                 evidence_type: None,
                 tags: Vec::new(),
+                is_fallback: false,
             }
         })
         .collect()
+}
+
+/// 解析失败或零草稿时的兜底草稿：文件名做标题，确保文件可搜索。
+pub fn create_fallback_draft(
+    file_path: &str,
+    source_file_id: i64,
+    error_msg: &str,
+) -> DraftItem {
+    let stem = Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("未知文件")
+        .to_string();
+    let occur_date = extract_fname_date(file_path);
+    DraftItem {
+        title: stem,
+        item_type: "完成".to_string(),
+        occur_date,
+        project: None,
+        points_text: format!("（解析失败：{}。标题来自文件名，请手动补充内容）", error_msg),
+        quant_value: None,
+        source_file_id,
+        evidence_type: None,
+        tags: Vec::new(),
+        is_fallback: true,
+    }
 }
