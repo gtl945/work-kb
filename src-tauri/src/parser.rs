@@ -65,6 +65,340 @@ pub fn parse_pdf(path: &Path) -> Result<ParseResult, ParseError> {
     })
 }
 
+/// TXT：Rust 原生读取，按空行分段。优先 UTF-8，回退 GBK。
+pub fn parse_txt(path: &Path) -> Result<ParseResult, ParseError> {
+    let bytes = std::fs::read(path).map_err(|e| ParseError::Io(e.to_string()))?;
+    let content = decode_text(&bytes);
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("TXT")
+        .to_string();
+    let sections = split_by_paragraphs(&content);
+    Ok(ParseResult {
+        source_path: path.to_string_lossy().to_string(),
+        doc_title: title,
+        sections,
+    })
+}
+
+/// MD：Rust 原生，按 # 标题分层。
+pub fn parse_md(path: &Path) -> Result<ParseResult, ParseError> {
+    let bytes = std::fs::read(path).map_err(|e| ParseError::Io(e.to_string()))?;
+    let content = decode_text(&bytes);
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("MD")
+        .to_string();
+    let mut sections: Vec<Section> = Vec::new();
+    let mut cur_heading = String::new();
+    let mut cur_level: u32 = 0;
+    let mut cur_body = String::new();
+    let mut started = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            if started {
+                sections.push(Section {
+                    heading: cur_heading.clone(),
+                    level: cur_level,
+                    body: cur_body.trim().to_string(),
+                    page: None,
+                });
+                cur_body.clear();
+            }
+            let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+            cur_level = hashes as u32;
+            cur_heading = trimmed[hashes..].trim().to_string();
+            started = true;
+        } else if !trimmed.is_empty() {
+            cur_body.push_str(line);
+            cur_body.push('\n');
+            started = true;
+        }
+    }
+    if started {
+        sections.push(Section {
+            heading: cur_heading,
+            level: cur_level,
+            body: cur_body.trim().to_string(),
+            page: None,
+        });
+    }
+    if sections.is_empty() {
+        sections.push(Section {
+            heading: title.clone(),
+            level: 0,
+            body: content,
+            page: None,
+        });
+    }
+    Ok(ParseResult {
+        source_path: path.to_string_lossy().to_string(),
+        doc_title: title,
+        sections,
+    })
+}
+
+/// CSV：Rust 原生，按行解析（支持引号），首行为表头，输出 TSV 格式。
+pub fn parse_csv(path: &Path) -> Result<ParseResult, ParseError> {
+    let bytes = std::fs::read(path).map_err(|e| ParseError::Io(e.to_string()))?;
+    let content = decode_text(&bytes);
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("CSV")
+        .to_string();
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(parse_csv_line(line));
+    }
+
+    let heading = if !rows.is_empty() {
+        rows[0].join(" | ")
+    } else {
+        String::new()
+    };
+    let body = rows
+        .iter()
+        .map(|r| r.join("\t"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(ParseResult {
+        source_path: path.to_string_lossy().to_string(),
+        doc_title: title,
+        sections: vec![Section {
+            heading,
+            level: 0,
+            body,
+            page: None,
+        }],
+    })
+}
+
+/// HTML：Rust 原生，去标签提取正文，按 h1-h6 分层。
+pub fn parse_html(path: &Path) -> Result<ParseResult, ParseError> {
+    let bytes = std::fs::read(path).map_err(|e| ParseError::Io(e.to_string()))?;
+    let content = decode_text(&bytes);
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("HTML")
+        .to_string();
+
+    let cleaned = clean_html(&content);
+    let mut sections: Vec<Section> = Vec::new();
+    let mut cur_heading = String::new();
+    let mut cur_level: u32 = 0;
+    let mut cur_body = String::new();
+    let mut started = false;
+
+    for line in cleaned.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            if started {
+                sections.push(Section {
+                    heading: cur_heading.clone(),
+                    level: cur_level,
+                    body: cur_body.trim().to_string(),
+                    page: None,
+                });
+                cur_body.clear();
+            }
+            let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+            cur_level = hashes as u32;
+            cur_heading = trimmed[hashes..].trim().to_string();
+            started = true;
+        } else {
+            cur_body.push_str(trimmed);
+            cur_body.push('\n');
+            started = true;
+        }
+    }
+    if started {
+        sections.push(Section {
+            heading: cur_heading,
+            level: cur_level,
+            body: cur_body.trim().to_string(),
+            page: None,
+        });
+    }
+    if sections.is_empty() {
+        sections.push(Section {
+            heading: title.clone(),
+            level: 0,
+            body: cleaned,
+            page: None,
+        });
+    }
+    Ok(ParseResult {
+        source_path: path.to_string_lossy().to_string(),
+        doc_title: title,
+        sections,
+    })
+}
+
+/// 解码：优先 UTF-8，回退 GBK（中文常见编码）。
+fn decode_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            let (cow, _, _) = encoding_rs::GBK.decode(bytes);
+            cow.into_owned()
+        }
+    }
+}
+
+/// 按空行分段。
+fn split_by_paragraphs(text: &str) -> Vec<Section> {
+    let paras: Vec<&str> = text
+        .split("\n\n")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if paras.is_empty() {
+        return vec![Section {
+            heading: String::new(),
+            level: 0,
+            body: text.to_string(),
+            page: None,
+        }];
+    }
+    paras
+        .iter()
+        .map(|p| Section {
+            heading: String::new(),
+            level: 0,
+            body: p.to_string(),
+            page: None,
+        })
+        .collect()
+}
+
+/// 解析单行 CSV（支持引号包裹和转义）。
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            if in_quotes {
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                in_quotes = true;
+            }
+        } else if c == ',' && !in_quotes {
+            fields.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    fields.push(current.trim().to_string());
+    fields
+}
+
+/// 清理 HTML：移除 script/style，转换标题为 Markdown 格式，去标签，解码实体。
+fn clean_html(html: &str) -> String {
+    let mut result = html.to_string();
+
+    let remove_block = |result: &str, tag_start: &str, tag_end: &str| -> String {
+        let lower = result.to_lowercase();
+        let mut out = String::new();
+        let mut pos = 0;
+        while let Some(start) = lower[pos..].find(tag_start) {
+            let abs_start = pos + start;
+            out.push_str(&result[pos..abs_start]);
+            if let Some(end) = lower[abs_start..].find(tag_end) {
+                pos = abs_start + end + tag_end.len();
+            } else {
+                break;
+            }
+        }
+        out.push_str(&result[pos..]);
+        out
+    };
+
+    result = remove_block(&result, "<script", "</script>");
+    result = remove_block(&result, "<style", "</style>");
+
+    for i in 1..=6u32 {
+        let prefix = "#".repeat(i as usize);
+        for open in &[format!("<h{}>", i), format!("<H{}>", i)] {
+            result = result.replace(open, &format!("\n{} ", prefix));
+        }
+        for close in &[format!("</h{}>", i), format!("</H{}>", i)] {
+            result = result.replace(close, "\n");
+        }
+    }
+
+    for tag in &[
+        "<br>", "<br/>", "<br />", "<BR>", "<BR/>",
+        "<p>", "</p>", "<P>", "</P>",
+        "<div>", "</div>", "<DIV>", "</DIV>",
+        "<li>", "</li>", "<LI>", "</LI>",
+        "<tr>", "</tr>", "<TR>", "</TR>",
+    ] {
+        result = result.replace(tag, "\n");
+    }
+
+    for tag in &["</td>", "</th>", "</TD>", "</TH>"] {
+        result = result.replace(tag, "\t");
+    }
+    for tag in &["<td>", "<th>", "<TD>", "<TH>"] {
+        result = result.replace(tag, "");
+    }
+
+    let mut stripped = String::new();
+    let mut in_tag = false;
+    for c in result.chars() {
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            stripped.push(c);
+        }
+    }
+
+    stripped = decode_html_entities(&stripped);
+
+    while stripped.contains("\n\n\n") {
+        stripped = stripped.replace("\n\n\n", "\n\n");
+    }
+    stripped
+}
+
+/// 解码基本 HTML 实体。
+fn decode_html_entities(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&hellip;", "...")
+        .replace("&mdash;", "\u{2014}")
+        .replace("&ndash;", "\u{2013}")
+}
+
 /// Python sidecar 客户端：常驻进程，JSON-RPC over stdio。
 pub struct SidecarClient {
     stdin: ChildStdin,
@@ -193,7 +527,7 @@ fn resolve_script_path() -> String {
     "sidecar/parse_server.py".to_string()
 }
 
-/// 按扩展名路由：PDF→Rust 原生；docx/xlsx/pptx→Python sidecar（懒启动）。
+/// 按扩展名路由：PDF/TXT/MD/CSV/HTML→Rust 原生；Office 系→Python sidecar（懒启动）。
 pub fn dispatch_parse(
     path: &Path,
     sidecar: &mut Option<SidecarClient>,
@@ -205,7 +539,11 @@ pub fn dispatch_parse(
         .unwrap_or_default();
     match ext.as_str() {
         "pdf" => parse_pdf(path),
-        "docx" | "xlsx" | "pptx" => {
+        "txt" => parse_txt(path),
+        "md" | "markdown" => parse_md(path),
+        "csv" => parse_csv(path),
+        "html" | "htm" => parse_html(path),
+        "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" | "rtf" | "wps" | "et" | "dps" => {
             if sidecar.is_none() {
                 *sidecar = Some(SidecarClient::start()?);
             }
