@@ -1,0 +1,14 @@
+node_modules
+dist
+.venv
+.DS_Store
+*.log
+
+# Rust build output
+src-tauri/target/
+
+# PyInstaller artifacts
+src-tauri/sidecar/dist/
+src-tauri/sidecar/build/
+src-tauri/sidecar/parse_server.spec
+src-tauri/sidecar/parse_server.exe
