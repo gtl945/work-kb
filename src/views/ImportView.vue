@@ -2,18 +2,45 @@
   <div class="import-view">
     <h2>文件导入与提炼</h2>
     <p class="muted">
-      选择本地办公文件（Word / Excel / PPT / PDF），自动解析 → 标题切块 → 规则抽字段，确认后入库。
+      选择文件或文件夹，自动解析 → 标题切块 → 规则抽字段，确认后入库。支持递归扫描子文件夹。
     </p>
 
     <div class="picker-row">
-      <el-button type="primary" :loading="loading" @click="onPick">
+      <el-button type="primary" :loading="loading || scanning" @click="onPick">
         <el-icon style="margin-right: 6px"><Upload /></el-icon>
         选择文件
       </el-button>
-      <span v-if="fileList.length" class="file-count">
-        已选 {{ fileList.length }} 个文件
-      </span>
+      <el-button type="success" :loading="loading || scanning" @click="onPickFolder">
+        <el-icon style="margin-right: 6px"><FolderOpened /></el-icon>
+        选择文件夹
+      </el-button>
     </div>
+
+    <!-- 扫描摘要 -->
+    <el-alert
+      v-if="scanSummary"
+      :title="scanSummary"
+      type="info"
+      show-icon
+      :closable="true"
+      style="margin-top: 14px"
+    >
+      <template #default>
+        <div class="scan-actions" v-if="pendingFiles.length > 0">
+          <el-button type="primary" size="small" :loading="loading" @click="onBatchParse">
+            开始解析（{{ pendingFiles.length }} 个）
+          </el-button>
+        </div>
+      </template>
+    </el-alert>
+
+    <!-- 解析进度 -->
+    <el-progress
+      v-if="loading && totalParse > 0"
+      :percentage="Math.round((parsedCount / totalParse) * 100)"
+      :status="parsedCount === totalParse ? 'success' : ''"
+      style="margin-top: 14px"
+    />
 
     <el-alert
       v-if="err"
@@ -35,43 +62,57 @@
           {{ f.draftCount }} 条草稿
         </el-tag>
         <el-tooltip v-if="f.status === 'error'" :content="f.errorMsg || '解析失败'" placement="top">
-          <el-tag size="small" type="danger">失败 - 查看详情</el-tag>
+          <el-tag size="small" type="danger">失败</el-tag>
+        </el-tooltip>
+        <el-tooltip v-if="f.status === 'skipped'" :content="f.errorMsg || '已跳过'" placement="top">
+          <el-tag size="small" type="warning">跳过</el-tag>
         </el-tooltip>
       </div>
     </div>
 
-    <!-- 空状态：尚未选择任何文件 -->
+    <!-- 空状态 -->
     <el-empty
-      v-if="!fileList.length && !err"
-      description="点击上方按钮选择办公文件，支持批量导入"
+      v-if="!fileList.length && !err && !scanSummary"
+      description="点击上方按钮选择文件或文件夹，支持批量导入"
     >
       <template #footer>
-        <el-button type="primary" @click="onPick">选择文件</el-button>
+        <div class="empty-actions">
+          <el-button type="primary" @click="onPick">选择文件</el-button>
+          <el-button type="success" @click="onPickFolder">选择文件夹</el-button>
+        </div>
       </template>
     </el-empty>
-
-    <!-- 空状态：文件已解析但未提取到草稿 -->
-    <el-alert
-      v-if="fileList.length && !drafts.length && !loading && allParsed"
-      type="info"
-      title="未从文件中提取到草稿条目"
-      description="可能原因：文件内容为空、无标题层级、或格式不标准。可尝试手动导入其他文件。"
-      show-icon
-      :closable="false"
-      style="margin-top: 14px"
-    />
 
     <!-- 草稿编辑区 -->
     <div v-if="drafts.length" class="drafts">
       <div class="toolbar">
-        <span>共 {{ drafts.length }} 条草稿</span>
-        <el-button type="primary" :loading="confirming" @click="onConfirm">
-          确认入库
-        </el-button>
+        <span>
+          共 {{ drafts.length }} 条草稿
+          <el-tag v-if="fallbackCount > 0" size="small" type="danger" style="margin-left: 8px">
+            {{ fallbackCount }} 条解析失败·自动生成
+          </el-tag>
+          <el-tag v-if="dupCount > 0" size="small" type="warning" style="margin-left: 8px">
+            {{ dupCount }} 条疑似重复
+          </el-tag>
+        </span>
+        <div class="toolbar-actions">
+          <el-button v-if="dupCount > 0" size="small" @click="onSkipDuplicates">
+            跳过重复（{{ dupCount }}）
+          </el-button>
+          <el-button type="primary" :loading="confirming" @click="onConfirm">
+            全部确认入库
+          </el-button>
+        </div>
       </div>
       <el-card v-for="(d, i) in drafts" :key="i" class="draft" shadow="never">
         <div class="draft-source">
           <el-tag size="small" type="info" effect="plain">{{ d._sourceName }}</el-tag>
+          <el-tag v-if="d._isFallback" size="small" type="danger" style="margin-left: 8px">
+            解析失败·自动生成
+          </el-tag>
+          <el-tag v-if="d._isDuplicate" size="small" type="warning" style="margin-left: 8px">
+            疑似重复
+          </el-tag>
         </div>
         <div class="row">
           <el-select v-model="d.itemType" style="width: 110px">
@@ -117,78 +158,180 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { ElMessage } from "element-plus";
-import { Upload, Document } from "@element-plus/icons-vue";
-import { pickFiles, importFiles, parseFile, confirmItems, type DraftItem } from "@/api";
+import { Upload, Document, FolderOpened } from "@element-plus/icons-vue";
+import {
+  pickFiles,
+  pickFolder,
+  importFiles,
+  parseFile,
+  confirmItems,
+  scanFolder,
+  checkItemDuplicate,
+  type DraftItem,
+  type ScannedFile,
+} from "@/api";
 
 interface FileEntry {
   name: string;
   path: string;
-  status: "pending" | "parsing" | "done" | "error";
+  status: "pending" | "parsing" | "done" | "error" | "skipped";
   draftCount: number;
   errorMsg?: string;
 }
 
 interface DraftRow extends DraftItem {
   _sourceName: string;
+  _isDuplicate: boolean;
+  _isFallback: boolean;
 }
 
 const loading = ref(false);
+const scanning = ref(false);
 const confirming = ref(false);
 const err = ref("");
 const fileList = ref<FileEntry[]>([]);
 const drafts = ref<DraftRow[]>([]);
 const tagsText = ref<string[]>([]);
+const scanSummary = ref("");
+const parsedCount = ref(0);
+const totalParse = ref(0);
 
-const allParsed = computed(() =>
-  fileList.value.length > 0 && fileList.value.every((f) => f.status === "done" || f.status === "error")
+const pendingFiles = computed(() =>
+  fileList.value.filter((f) => f.status === "pending")
+);
+
+const dupCount = computed(() =>
+  drafts.value.filter((d) => d._isDuplicate).length
+);
+
+const fallbackCount = computed(() =>
+  drafts.value.filter((d) => d._isFallback).length
 );
 
 async function onPick() {
   err.value = "";
+  scanSummary.value = "";
   const paths = await pickFiles();
   if (!paths) return;
 
-  const entries: FileEntry[] = paths.map((p) => {
+  fileList.value = paths.map((p) => {
     const name = p.split(/[\\/]/).pop() || p;
     return { name, path: p, status: "pending" as const, draftCount: 0 };
   });
-  fileList.value = entries;
   drafts.value = [];
   tagsText.value = [];
 
-  loading.value = true;
-  try {
-    const ids = await importFiles(paths);
+  await doImportAndParse();
+}
 
-    for (let fi = 0; fi < ids.length; fi++) {
-      fileList.value[fi].status = "parsing";
-      try {
-        const list = await parseFile(ids[fi]);
-        const rows: DraftRow[] = list.map((d) => ({
-          ...d,
-          _sourceName: entries[fi].name,
-        }));
-        drafts.value.push(...rows);
-        tagsText.value.push(...rows.map((d) => (d.tags || []).join(", ")));
-        fileList.value[fi].status = "done";
-        fileList.value[fi].draftCount = list.length;
-      } catch (e) {
-        fileList.value[fi].status = "error";
-        fileList.value[fi].errorMsg = String(e);
-        console.error(`解析 ${entries[fi].name} 失败:`, e);
+async function onPickFolder() {
+  err.value = "";
+  scanSummary.value = "";
+  const folderPath = await pickFolder();
+  if (!folderPath) return;
+
+  scanning.value = true;
+  try {
+    const scanned: ScannedFile[] = await scanFolder(folderPath);
+    if (!scanned.length) {
+      ElMessage.warning("未在文件夹中找到支持的文件格式");
+      return;
+    }
+
+    const registered = scanned.filter((s) => s.alreadyRegistered);
+    const pending = scanned.filter((s) => !s.alreadyRegistered);
+
+    fileList.value = scanned.map((s) => ({
+      name: s.filename,
+      path: s.path,
+      status: s.alreadyRegistered ? ("skipped" as const) : ("pending" as const),
+      draftCount: 0,
+      errorMsg: s.alreadyRegistered ? "已登记" : undefined,
+    }));
+
+    scanSummary.value = `找到 ${scanned.length} 个文件，已登记 ${registered.length} 个，待解析 ${pending.length} 个`;
+    drafts.value = [];
+    tagsText.value = [];
+  } catch (e) {
+    err.value = `文件夹扫描失败：${String(e)}`;
+  } finally {
+    scanning.value = false;
+  }
+}
+
+async function onBatchParse() {
+  await doImportAndParse();
+}
+
+async function doImportAndParse() {
+  const toProcess = fileList.value.filter((f) => f.status === "pending");
+  if (!toProcess.length) return;
+
+  loading.value = true;
+  err.value = "";
+  totalParse.value = toProcess.length;
+  parsedCount.value = 0;
+
+  try {
+    const paths = toProcess.map((f) => f.path);
+    const results = await importFiles(paths);
+
+    for (let fi = 0; fi < results.length; fi++) {
+      const result = results[fi];
+      const fileEntry = toProcess[fi];
+      const fileIdx = fileList.value.indexOf(fileEntry);
+
+      if (!result.isNew) {
+        fileList.value[fileIdx].status = "skipped";
+        fileList.value[fileIdx].errorMsg = result.duplicateReason || "重复";
+        parsedCount.value++;
+        continue;
       }
+
+      fileList.value[fileIdx].status = "parsing";
+      try {
+        const list = await parseFile(result.fileId);
+        const sourceName = fileEntry.name;
+
+        for (const d of list) {
+          const isDup = await checkItemDuplicate(
+            d.title,
+            d.occurDate
+          ).catch(() => false);
+
+          drafts.value.push({ ...d, _sourceName: sourceName, _isDuplicate: isDup, _isFallback: d.isFallback || false });
+          tagsText.value.push((d.tags || []).join(", "));
+        }
+
+        fileList.value[fileIdx].status = "done";
+        fileList.value[fileIdx].draftCount = list.length;
+      } catch (e) {
+        fileList.value[fileIdx].status = "error";
+        fileList.value[fileIdx].errorMsg = String(e);
+      }
+      parsedCount.value++;
     }
 
     if (drafts.value.length) {
-      ElMessage.success(`提炼完成，共 ${drafts.value.length} 条草稿`);
+      const fbMsg = fallbackCount.value ? `，${fallbackCount.value} 条解析失败已自动生成` : "";
+      const dupMsg = dupCount.value ? `，${dupCount.value} 条疑似重复` : "";
+      ElMessage.success(`提炼完成，共 ${drafts.value.length} 条草稿${fbMsg}${dupMsg}`);
     } else {
       ElMessage.warning("未提取到任何草稿条目，请检查文件内容或格式");
     }
   } catch (e) {
-    err.value = `文件登记失败：${String(e)}。请确认文件路径可访问后重试。`;
+    err.value = `文件登记失败：${String(e)}`;
   } finally {
     loading.value = false;
   }
+}
+
+function onSkipDuplicates() {
+  const keep = drafts.value.filter((d) => !d._isDuplicate);
+  const removed = drafts.value.length - keep.length;
+  drafts.value = keep;
+  tagsText.value = tagsText.value.slice(0, keep.length);
+  ElMessage.success(`已跳过 ${removed} 条重复草稿`);
 }
 
 async function onConfirm() {
@@ -213,6 +356,7 @@ async function onConfirm() {
     drafts.value = [];
     tagsText.value = [];
     fileList.value = [];
+    scanSummary.value = "";
   } catch (e) {
     ElMessage.error(`入库失败：${String(e)}`);
   } finally {
@@ -231,9 +375,8 @@ async function onConfirm() {
   align-items: center;
   gap: 14px;
 }
-.file-count {
-  color: #6b7588;
-  font-size: 14px;
+.scan-actions {
+  margin-top: 8px;
 }
 .file-list {
   margin-top: 16px;
@@ -252,6 +395,11 @@ async function onConfirm() {
   white-space: nowrap;
   font-size: 14px;
 }
+.empty-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
 .drafts {
   margin-top: 18px;
 }
@@ -260,6 +408,10 @@ async function onConfirm() {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 12px;
+}
+.toolbar-actions {
+  display: flex;
+  gap: 8px;
 }
 .draft {
   margin-bottom: 12px;
