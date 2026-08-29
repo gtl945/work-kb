@@ -1,6 +1,7 @@
 use crate::extractor::DraftItem;
 use crate::searcher::{self, SearchFilters, SearchResult};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
@@ -36,17 +37,68 @@ pub struct TagInfo {
     pub item_count: i64,
 }
 
+/// 数据库信息（数据库状态页）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableInfo {
+    pub name: String,
+    pub row_count: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbInfo {
+    pub db_path: String,
+    pub db_size: i64,
+    pub tables: Vec<TableInfo>,
+}
+
+/// 已登记源文件信息（数据库状态页）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileInfo {
+    pub id: i64,
+    pub filename: String,
+    pub path: String,
+    pub ext: String,
+    pub size: Option<i64>,
+    pub imported_at: i64,
+    pub item_count: i64,
+}
+
+/// 文件夹扫描结果（文件夹批量导入）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScannedFile {
+    pub path: String,
+    pub filename: String,
+    pub ext: String,
+    pub size: Option<i64>,
+    pub already_registered: bool,
+    pub file_id: Option<i64>,
+}
+
+/// 文件登记结果（含查重信息）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterResult {
+    pub file_id: i64,
+    pub is_new: bool,
+    pub duplicate_reason: Option<String>,
+}
+
 /// 本地 SQLite 数据库句柄。
 pub struct Database {
     conn: Connection,
+    db_path: std::path::PathBuf,
 }
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let conn = Connection::open(path)?;
-        // WAL：写入不阻塞读取；外键级联生效。
+        // WAL：写入不阻塞读取；外外键级联生效。
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        Ok(Self { conn })
+        Ok(Self { conn, db_path: path.to_path_buf() })
     }
 
     /// 执行建库脚本（幂等，可重复执行）。
@@ -66,8 +118,9 @@ impl Database {
         Ok(names.join(", "))
     }
 
-    /// 登记一个本地文件（v1 仅存路径引用），返回自增 id。
-    pub fn register_file(&self, path: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    /// 登记一个本地文件，计算 SHA-256 哈希并查重。
+    /// 路径重复 → 返回已有 id；哈希重复 → 返回已有 id；否则新建。
+    pub fn register_file(&self, path: &str) -> Result<RegisterResult, Box<dyn std::error::Error>> {
         let p = Path::new(path);
         let filename = p
             .file_name()
@@ -80,11 +133,39 @@ impl Database {
             .map(|s| s.to_lowercase())
             .unwrap_or_default();
         let size = fs::metadata(p).ok().map(|m| m.len() as i64);
+
+        // 路径查重
+        let mut stmt = self.conn.prepare("SELECT id FROM files WHERE path = ?1")?;
+        if let Ok(existing_id) = stmt.query_row(params![path], |row| row.get::<_, i64>(0)) {
+            return Ok(RegisterResult {
+                file_id: existing_id,
+                is_new: false,
+                duplicate_reason: Some("路径已存在".to_string()),
+            });
+        }
+
+        // 哈希查重
+        let hash = compute_file_hash(path);
+        if let Some(ref h) = hash {
+            let mut stmt2 = self.conn.prepare("SELECT id FROM files WHERE hash = ?1")?;
+            if let Ok(existing_id) = stmt2.query_row(params![h], |row| row.get::<_, i64>(0)) {
+                return Ok(RegisterResult {
+                    file_id: existing_id,
+                    is_new: false,
+                    duplicate_reason: Some("内容已存在".to_string()),
+                });
+            }
+        }
+
         self.conn.execute(
-            "INSERT INTO files (path, filename, ext, size, imported_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![path, filename, ext, size, now_unix()],
+            "INSERT INTO files (path, filename, ext, size, hash, imported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![path, filename, ext, size, hash, now_unix()],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(RegisterResult {
+            file_id: self.conn.last_insert_rowid(),
+            is_new: true,
+            duplicate_reason: None,
+        })
     }
 
     /// 按 id 取文件路径。
@@ -351,6 +432,201 @@ impl Database {
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
+
+    /// 获取数据库信息（路径、大小、各表行数）。
+    pub fn get_db_info(&self) -> Result<DbInfo, Box<dyn std::error::Error>> {
+        let db_path = self.db_path.display().to_string();
+        let db_size = fs::metadata(&self.db_path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )?;
+        let table_names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut tables = Vec::with_capacity(table_names.len());
+        for name in &table_names {
+            let count: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM \"{}\"", name),
+                [],
+                |row| row.get(0),
+            )?;
+            tables.push(TableInfo {
+                name: name.clone(),
+                row_count: count,
+            });
+        }
+
+        Ok(DbInfo {
+            db_path,
+            db_size,
+            tables,
+        })
+    }
+
+    /// 获取所有已登记源文件列表（含关联条目数）。
+    pub fn get_file_list(&self) -> Result<Vec<FileInfo>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, f.filename, f.path, f.ext, f.size, f.imported_at,
+                    (SELECT COUNT(*) FROM items WHERE source_file_id = f.id) AS item_count
+             FROM files f
+             ORDER BY f.imported_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(FileInfo {
+                id: row.get(0)?,
+                filename: row.get(1)?,
+                path: row.get(2)?,
+                ext: row.get(3)?,
+                size: row.get(4)?,
+                imported_at: row.get(5)?,
+                item_count: row.get(6)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// 导出数据库到指定路径（备份）。
+    pub fn export_data(&self, target_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+        std::fs::copy(&self.db_path, target_path)?;
+        Ok(())
+    }
+
+    /// 从指定路径导入数据库（恢复），覆盖现有全部数据。
+    pub fn import_data(&mut self, source_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let escaped = source_path.replace('\'', "''");
+        self.conn.execute(
+            &format!("ATTACH DATABASE '{}' AS src", escaped),
+            [],
+        )?;
+
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM items_fts", [])?;
+        tx.execute("DELETE FROM item_tags", [])?;
+        tx.execute("DELETE FROM items", [])?;
+        tx.execute("DELETE FROM tags", [])?;
+        tx.execute("DELETE FROM projects", [])?;
+        tx.execute("DELETE FROM files", [])?;
+
+        tx.execute("INSERT INTO files SELECT * FROM src.files", [])?;
+        tx.execute("INSERT INTO projects SELECT * FROM src.projects", [])?;
+        tx.execute("INSERT INTO tags SELECT * FROM src.tags", [])?;
+        tx.execute("INSERT INTO items SELECT * FROM src.items", [])?;
+        tx.execute("INSERT INTO item_tags SELECT * FROM src.item_tags", [])?;
+        tx.execute(
+            "INSERT INTO items_fts(rowid, title_seg, points_seg, pinyin_full, pinyin_initial, ngram)
+             SELECT rowid, title_seg, points_seg, pinyin_full, pinyin_initial, ngram
+             FROM src.items_fts",
+            [],
+        )?;
+
+        tx.commit()?;
+        self.conn.execute("DETACH DATABASE src", [])?;
+        Ok(())
+    }
+
+    /// 递归扫描文件夹，返回所有支持的文件，标注是否已登记（按路径查重）。
+    pub fn scan_folder(&self, folder_path: &str) -> Result<Vec<ScannedFile>, Box<dyn std::error::Error>> {
+        let mut results = Vec::new();
+        scan_dir_recursive(folder_path, &mut results, self)?;
+        Ok(results)
+    }
+
+    /// 检查条目是否疑似重复（标题 + 日期相同）。
+    pub fn check_item_duplicate(
+        &self,
+        title: &str,
+        occur_date: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let count: i64 = match occur_date {
+            Some(date) => self.conn.query_row(
+                "SELECT COUNT(*) FROM items WHERE title = ?1 AND occur_date = ?2",
+                params![title, date],
+                |row| row.get(0),
+            )?,
+            None => self.conn.query_row(
+                "SELECT COUNT(*) FROM items WHERE title = ?1 AND occur_date IS NULL",
+                params![title],
+                |row| row.get(0),
+            )?,
+        };
+        Ok(count > 0)
+    }
+}
+
+const SUPPORTED_EXTS: &[&str] = &[
+    "pdf", "docx", "xlsx", "pptx", "doc", "xls", "ppt",
+    "txt", "csv", "md", "html", "htm", "rtf", "wps", "et", "dps",
+];
+
+fn scan_dir_recursive(
+    dir: &str,
+    results: &mut Vec<ScannedFile>,
+    db: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir_recursive(&path.display().to_string(), results, db)?;
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        if !SUPPORTED_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+
+        let path_str = path.display().to_string();
+        let filename = entry.file_name().to_string_lossy().to_string();
+        let size = entry.metadata().ok().map(|m| m.len() as i64);
+
+        // 按路径查重
+        let mut stmt = db.conn.prepare("SELECT id FROM files WHERE path = ?1")?;
+        let existing_id = stmt
+            .query_row(params![&path_str], |row| row.get::<_, i64>(0))
+            .ok();
+
+        results.push(ScannedFile {
+            path: path_str,
+            filename,
+            ext,
+            size,
+            already_registered: existing_id.is_some(),
+            file_id: existing_id,
+        });
+    }
+    Ok(())
+}
+
+fn compute_file_hash(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn now_unix() -> i64 {
