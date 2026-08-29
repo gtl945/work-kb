@@ -15,6 +15,10 @@
           <el-icon><Document /></el-icon>
           <span>报告导出</span>
         </el-menu-item>
+        <el-menu-item index="/database">
+          <el-icon><Coin /></el-icon>
+          <span>数据库</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
     <el-container>
@@ -34,7 +38,7 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useRoute } from "vue-router";
-import { Upload, Search, Document } from "@element-plus/icons-vue";
+import { Upload, Search, Document, Coin } from "@element-plus/icons-vue";
 import { dbStatus } from "@/api";
 
 const route = useRoute();
