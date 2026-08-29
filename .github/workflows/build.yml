@@ -1,0 +1,67 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r src-tauri/sidecar/requirements.txt pyinstaller
+
+      - name: Build sidecar (PyInstaller)
+        run: |
+          cd src-tauri/sidecar
+          pyinstaller --onefile --name parse_server --noconfirm parse_server.py
+          cp dist/parse_server.exe .
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build Tauri app
+        run: npm run tauri build
+
+      - name: Copy sidecar to release directory
+        run: |
+          mkdir -p src-tauri/target/release/sidecar
+          cp src-tauri/sidecar/parse_server.exe src-tauri/target/release/sidecar/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: work-kb-windows
+          path: |
+            src-tauri/target/release/work-kb.exe
+            src-tauri/target/release/sidecar/parse_server.exe
+            src-tauri/target/release/bundle/nsis/
+            src-tauri/target/release/bundle/msi/
