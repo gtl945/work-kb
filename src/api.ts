@@ -5,11 +5,22 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 export async function pickFiles(): Promise<string[] | null> {
   const selected = await open({
     multiple: true,
-    filters: [{ name: "办公文档", extensions: ["docx", "xlsx", "pptx", "pdf"] }],
+    filters: [{ name: "办公文档", extensions: [
+      "docx", "xlsx", "pptx", "pdf",
+      "doc", "xls", "ppt",
+      "txt", "csv", "md", "html", "htm",
+      "rtf", "wps", "et", "dps"
+   ] }],
   });
   if (!selected) return null;
   if (Array.isArray(selected)) return selected;
   return [selected];
+}
+
+export async function pickFolder(): Promise<string | null> {
+  const selected = await open({ directory: true });
+  if (!selected || Array.isArray(selected)) return null;
+  return selected;
 }
 
 export async function ping(): Promise<string> {
@@ -20,8 +31,14 @@ export async function dbStatus(): Promise<string> {
   return invoke<string>("db_status");
 }
 
-export async function importFiles(paths: string[]): Promise<number[]> {
-  return invoke<number[]>("import_files", { paths });
+export interface RegisterResult {
+  fileId: number;
+  isNew: boolean;
+  duplicateReason: string | null;
+}
+
+export async function importFiles(paths: string[]): Promise<RegisterResult[]> {
+  return invoke<RegisterResult[]>("import_files", { paths });
 }
 
 export interface Section {
@@ -47,6 +64,7 @@ export interface DraftItem {
   sourceFileId: number;
   evidenceType: string | null;
   tags: string[];
+  isFallback?: boolean;
 }
 
 export async function parseFile(fileId: number): Promise<DraftItem[]> {
@@ -160,4 +178,82 @@ export async function getProjects(): Promise<ProjectInfo[]> {
 
 export async function getTags(): Promise<TagInfo[]> {
   return invoke<TagInfo[]>("get_tags");
+}
+
+// ---- 数据库状态页 ----
+
+export interface TableInfo {
+  name: string;
+  rowCount: number;
+}
+
+export interface DbInfo {
+  dbPath: string;
+  dbSize: number;
+  tables: TableInfo[];
+}
+
+export interface SourceFileInfo {
+  id: number;
+  filename: string;
+  path: string;
+  ext: string;
+  size: number | null;
+  importedAt: number;
+  itemCount: number;
+}
+
+export async function getDbInfo(): Promise<DbInfo> {
+  return invoke<DbInfo>("get_db_info");
+}
+
+export async function getFileList(): Promise<SourceFileInfo[]> {
+  return invoke<SourceFileInfo[]>("get_file_list");
+}
+
+export async function exportData(targetPath: string): Promise<void> {
+  await invoke<void>("export_data", { targetPath });
+}
+
+export async function importData(sourcePath: string): Promise<void> {
+  await invoke<void>("import_data", { sourcePath });
+}
+
+export async function pickDbSavePath(): Promise<string | null> {
+  const path = await save({
+    defaultPath: "workkb-backup.db",
+    filters: [{ name: "SQLite Database", extensions: ["db"] }],
+  });
+  return path ?? null;
+}
+
+export async function pickDbOpenPath(): Promise<string | null> {
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "SQLite Database", extensions: ["db"] }],
+  });
+  if (!selected) return null;
+  return Array.isArray(selected) ? selected[0] : selected;
+}
+
+// ---- 文件夹批量导入 + 查重 ----
+
+export interface ScannedFile {
+  path: string;
+  filename: string;
+  ext: string;
+  size: number | null;
+  alreadyRegistered: boolean;
+  fileId: number | null;
+}
+
+export async function scanFolder(folderPath: string): Promise<ScannedFile[]> {
+  return invoke<ScannedFile[]>("scan_folder", { folderPath });
+}
+
+export async function checkItemDuplicate(
+  title: string,
+  occurDate: string | null
+): Promise<boolean> {
+  return invoke<boolean>("check_item_duplicate", { title, occurDate });
 }
