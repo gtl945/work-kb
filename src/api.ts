@@ -2,14 +2,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 
 /// 唤起系统文件选择器，返回用户选中的本地文件路径列表（支持多选）。
+/// 扩展名列表须与 src-tauri/src/parser.rs 的 SUPPORTED_EXTS 保持同步。
 export async function pickFiles(): Promise<string[] | null> {
   const selected = await open({
     multiple: true,
-    filters: [{ name: "办公文档", extensions: [
+    filters: [{ name: "办公文档与图片", extensions: [
       "docx", "xlsx", "pptx", "pdf",
       "doc", "xls", "ppt",
       "txt", "csv", "md", "html", "htm",
-      "rtf", "wps", "et", "dps"
+      "rtf", "wps", "et", "dps",
+      "jpg", "jpeg", "png", "bmp", "gif", "tif", "tiff", "webp", "svg"
    ] }],
   });
   if (!selected) return null;
