@@ -1,13 +1,14 @@
 mod db;
 mod exporter;
 mod extractor;
+mod models;
 mod parser;
 mod searcher;
 
 use std::sync::Mutex;
 use tauri::Manager;
 
-use db::{DbInfo, FileInfo, ProjectInfo, RegisterResult, ScannedFile, StatsResult, TagInfo};
+use models::{DbInfo, FileInfo, ProjectInfo, RegisterResult, ScannedFile, StatsResult, TagInfo};
 use exporter::{ExportParams, ExportResult};
 use extractor::DraftItem;
 use parser::SidecarClient;
