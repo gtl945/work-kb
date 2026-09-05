@@ -142,7 +142,7 @@ pub fn parse_md(path: &Path) -> Result<ParseResult, ParseError> {
     })
 }
 
-/// CSV：Rust 原生，按行解析（支持引号），首行为表头，输出 TSV 格式。
+/// CSV：Rust 原生，自动检测分隔符，按行解析（支持引号），首行为表头，输出 TSV。
 pub fn parse_csv(path: &Path) -> Result<ParseResult, ParseError> {
     let bytes = std::fs::read(path).map_err(|e| ParseError::Io(e.to_string()))?;
     let content = decode_text(&bytes);
@@ -152,12 +152,13 @@ pub fn parse_csv(path: &Path) -> Result<ParseResult, ParseError> {
         .unwrap_or("CSV")
         .to_string();
 
+    let delim = detect_delimiter(&content);
     let mut rows: Vec<Vec<String>> = Vec::new();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        rows.push(parse_csv_line(line));
+        rows.push(parse_csv_line(line, delim));
     }
 
     let heading = if !rows.is_empty() {
@@ -248,6 +249,63 @@ pub fn parse_html(path: &Path) -> Result<ParseResult, ParseError> {
     })
 }
 
+/// SVG：Rust 原生，提取 <text>/<tspan>/<title>/<desc> 中的文字。
+pub fn parse_svg(path: &Path) -> Result<ParseResult, ParseError> {
+    let bytes = std::fs::read(path).map_err(|e| ParseError::Io(e.to_string()))?;
+    let content = decode_text(&bytes);
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("SVG")
+        .to_string();
+
+    let texts = extract_svg_texts(&content);
+    let body = texts
+        .iter()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| t.trim().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(ParseResult {
+        source_path: path.to_string_lossy().to_string(),
+        doc_title: title,
+        sections: vec![Section {
+            heading: String::new(),
+            level: 0,
+            body,
+            page: None,
+        }],
+    })
+}
+
+/// 从 SVG XML 中提取文本内容。
+fn extract_svg_texts(content: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    for tag in &["text", "tspan", "title", "desc"] {
+        let open = format!("<{}", tag);
+        let close = format!("</{}>", tag);
+        let lower = content.to_lowercase();
+        let mut pos = 0;
+        while let Some(start) = lower[pos..].find(&open) {
+            let abs_start = pos + start;
+            if let Some(end) = lower[abs_start..].find(&close) {
+                let raw = &content[abs_start + open.len()..abs_start + end];
+                if let Some(gt) = raw.find('>') {
+                    let text = &raw[gt + 1..];
+                    if !text.trim().is_empty() {
+                        results.push(decode_html_entities(text.trim()));
+                    }
+                }
+                pos = abs_start + end + close.len();
+            } else {
+                break;
+            }
+        }
+    }
+    results
+}
+
 /// 解码：优先 UTF-8，回退 GBK（中文常见编码）。
 fn decode_text(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
@@ -285,8 +343,8 @@ fn split_by_paragraphs(text: &str) -> Vec<Section> {
         .collect()
 }
 
-/// 解析单行 CSV（支持引号包裹和转义）。
-fn parse_csv_line(line: &str) -> Vec<String> {
+/// 解析单行 CSV（支持引号包裹和转义，可指定分隔符）。
+fn parse_csv_line(line: &str, delim: char) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
@@ -304,7 +362,7 @@ fn parse_csv_line(line: &str) -> Vec<String> {
             } else {
                 in_quotes = true;
             }
-        } else if c == ',' && !in_quotes {
+        } else if c == delim && !in_quotes {
             fields.push(current.trim().to_string());
             current.clear();
         } else {
@@ -313,6 +371,21 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     }
     fields.push(current.trim().to_string());
     fields
+}
+
+/// 自动检测 CSV 分隔符：统计前 5 行的逗号/Tab/分号频率。
+fn detect_delimiter(content: &str) -> char {
+    let sample: String = content.lines().take(5).collect();
+    let commas = sample.matches(',').count();
+    let tabs = sample.matches('\t').count();
+    let semicolons = sample.matches(';').count();
+    if tabs >= commas && tabs >= semicolons && tabs > 0 {
+        '\t'
+    } else if semicolons > commas && semicolons > 0 {
+        ';'
+    } else {
+        ','
+    }
 }
 
 /// 清理 HTML：移除 script/style，转换标题为 Markdown 格式，去标签，解码实体。
@@ -527,6 +600,13 @@ fn resolve_script_path() -> String {
     "sidecar/parse_server.py".to_string()
 }
 
+/// 支持的文件扩展名列表（单一数据源，db.rs 和 api.ts 均引用此定义）。
+pub const SUPPORTED_EXTS: &[&str] = &[
+    "pdf", "docx", "xlsx", "pptx", "doc", "xls", "ppt",
+    "txt", "csv", "md", "html", "htm", "rtf", "wps", "et", "dps",
+    "jpg", "jpeg", "png", "bmp", "gif", "tif", "tiff", "webp", "svg",
+];
+
 /// 按扩展名路由：PDF/TXT/MD/CSV/HTML→Rust 原生；Office 系→Python sidecar（懒启动）。
 pub fn dispatch_parse(
     path: &Path,
@@ -543,7 +623,9 @@ pub fn dispatch_parse(
         "md" | "markdown" => parse_md(path),
         "csv" => parse_csv(path),
         "html" | "htm" => parse_html(path),
-        "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" | "rtf" | "wps" | "et" | "dps" => {
+        "svg" => parse_svg(path),
+        "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" | "rtf" | "wps" | "et" | "dps"
+        | "jpg" | "jpeg" | "png" | "bmp" | "gif" | "tif" | "tiff" | "webp" => {
             if sidecar.is_none() {
                 *sidecar = Some(SidecarClient::start()?);
             }
