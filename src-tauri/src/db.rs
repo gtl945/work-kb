@@ -1,91 +1,26 @@
 use crate::extractor::DraftItem;
+use crate::models::{
+    DbInfo, FileInfo, ProjectInfo, RegisterResult, ScannedFile, StatsResult, TableInfo, TagInfo,
+};
+use crate::parser::SUPPORTED_EXTS;
 use crate::searcher::{self, SearchFilters, SearchResult};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
-/// 知识库统计数据（M6）。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatsResult {
-    pub total: i64,
-    pub completed: i64,
-    pub achievements: i64,
-    pub problems: i64,
-    pub highlights: i64,
-    pub file_count: i64,
-    pub project_count: i64,
-    pub tag_count: i64,
-}
+/// 搜索查询的 SELECT 列（search_items / query_items_by_date_range 共用）。
+const SEARCH_COLS: &str = "i.id, i.title, i.type, i.occur_date, i.points_text, i.quant_value,
+                           i.source_file_id, i.evidence_type,
+                           p.name as project_name,
+                           f.path as source_file_path, f.filename as source_file_name,
+                           GROUP_CONCAT(t.name, ',') as tag_names";
 
-/// 项目信息（M6 筛选用）。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectInfo {
-    pub id: i64,
-    pub name: String,
-    pub item_count: i64,
-}
-
-/// 标签信息（M6 筛选用）。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TagInfo {
-    pub id: i64,
-    pub name: String,
-    pub item_count: i64,
-}
-
-/// 数据库信息（数据库状态页）。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TableInfo {
-    pub name: String,
-    pub row_count: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DbInfo {
-    pub db_path: String,
-    pub db_size: i64,
-    pub tables: Vec<TableInfo>,
-}
-
-/// 已登记源文件信息（数据库状态页）。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileInfo {
-    pub id: i64,
-    pub filename: String,
-    pub path: String,
-    pub ext: String,
-    pub size: Option<i64>,
-    pub imported_at: i64,
-    pub item_count: i64,
-}
-
-/// 文件夹扫描结果（文件夹批量导入）。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScannedFile {
-    pub path: String,
-    pub filename: String,
-    pub ext: String,
-    pub size: Option<i64>,
-    pub already_registered: bool,
-    pub file_id: Option<i64>,
-}
-
-/// 文件登记结果（含查重信息）。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisterResult {
-    pub file_id: i64,
-    pub is_new: bool,
-    pub duplicate_reason: Option<String>,
-}
+/// 搜索查询的 LEFT JOIN 子句（search_items / query_items_by_date_range 共用）。
+const SEARCH_JOINS: &str = "LEFT JOIN projects p ON p.id = i.project_id
+                            LEFT JOIN files f ON f.id = i.source_file_id
+                            LEFT JOIN item_tags it ON it.item_id = i.id
+                            LEFT JOIN tags t ON t.id = it.tag_id";
 
 /// 本地 SQLite 数据库句柄。
 pub struct Database {
@@ -254,27 +189,22 @@ impl Database {
         let match_str = searcher::build_match_str(query);
 
         let results = if let Some(ms) = &match_str {
-            let sql = "SELECT i.id, i.title, i.type, i.occur_date, i.points_text, i.quant_value,
-                              i.source_file_id, i.evidence_type,
-                              p.name as project_name,
-                              f.path as source_file_path, f.filename as source_file_name,
-                              GROUP_CONCAT(t.name, ',') as tag_names
-                       FROM items_fts ft
-                       JOIN items i ON i.id = ft.rowid
-                       LEFT JOIN projects p ON p.id = i.project_id
-                       LEFT JOIN files f ON f.id = i.source_file_id
-                       LEFT JOIN item_tags it ON it.item_id = i.id
-                       LEFT JOIN tags t ON t.id = it.tag_id
-                       WHERE items_fts MATCH ?1
-                         AND (?2 IS NULL OR i.type = ?2)
-                         AND (?3 IS NULL OR i.occur_date >= ?3)
-                         AND (?4 IS NULL OR i.occur_date <= ?4)
-                         AND (?5 IS NULL OR i.evidence_type = ?5)
-                         AND (?6 IS NULL OR i.project_id = ?6)
-                       GROUP BY i.id
-                       ORDER BY i.occur_date DESC
-                       LIMIT ?7 OFFSET ?8";
-            let mut stmt = self.conn.prepare(sql)?;
+            let sql = format!(
+                "SELECT {SEARCH_COLS}
+                 FROM items_fts ft
+                 JOIN items i ON i.id = ft.rowid
+                 {SEARCH_JOINS}
+                 WHERE items_fts MATCH ?1
+                   AND (?2 IS NULL OR i.type = ?2)
+                   AND (?3 IS NULL OR i.occur_date >= ?3)
+                   AND (?4 IS NULL OR i.occur_date <= ?4)
+                   AND (?5 IS NULL OR i.evidence_type = ?5)
+                   AND (?6 IS NULL OR i.project_id = ?6)
+                 GROUP BY i.id
+                 ORDER BY i.occur_date DESC
+                 LIMIT ?7 OFFSET ?8"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(
                 params![ms, &filters.item_type, &filters.date_from, &filters.date_to,
                         &filters.evidence_type, &filters.project_id, limit, offset],
@@ -282,25 +212,20 @@ impl Database {
             )?;
             rows.filter_map(|r| r.ok()).collect()
         } else {
-            let sql = "SELECT i.id, i.title, i.type, i.occur_date, i.points_text, i.quant_value,
-                              i.source_file_id, i.evidence_type,
-                              p.name as project_name,
-                              f.path as source_file_path, f.filename as source_file_name,
-                              GROUP_CONCAT(t.name, ',') as tag_names
-                       FROM items i
-                       LEFT JOIN projects p ON p.id = i.project_id
-                       LEFT JOIN files f ON f.id = i.source_file_id
-                       LEFT JOIN item_tags it ON it.item_id = i.id
-                       LEFT JOIN tags t ON t.id = it.tag_id
-                       WHERE (?1 IS NULL OR i.type = ?1)
-                         AND (?2 IS NULL OR i.occur_date >= ?2)
-                         AND (?3 IS NULL OR i.occur_date <= ?3)
-                         AND (?4 IS NULL OR i.evidence_type = ?4)
-                         AND (?5 IS NULL OR i.project_id = ?5)
-                       GROUP BY i.id
-                       ORDER BY i.occur_date DESC
-                       LIMIT ?6 OFFSET ?7";
-            let mut stmt = self.conn.prepare(sql)?;
+            let sql = format!(
+                "SELECT {SEARCH_COLS}
+                 FROM items i
+                 {SEARCH_JOINS}
+                 WHERE (?1 IS NULL OR i.type = ?1)
+                   AND (?2 IS NULL OR i.occur_date >= ?2)
+                   AND (?3 IS NULL OR i.occur_date <= ?3)
+                   AND (?4 IS NULL OR i.evidence_type = ?4)
+                   AND (?5 IS NULL OR i.project_id = ?5)
+                 GROUP BY i.id
+                 ORDER BY i.occur_date DESC
+                 LIMIT ?6 OFFSET ?7"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(
                 params![&filters.item_type, &filters.date_from, &filters.date_to,
                         &filters.evidence_type, &filters.project_id, limit, offset],
@@ -339,21 +264,16 @@ impl Database {
         date_from: Option<&str>,
         date_to: Option<&str>,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>> {
-        let sql = "SELECT i.id, i.title, i.type, i.occur_date, i.points_text, i.quant_value,
-                          i.source_file_id, i.evidence_type,
-                          p.name as project_name,
-                          f.path as source_file_path, f.filename as source_file_name,
-                          GROUP_CONCAT(t.name, ',') as tag_names
-                   FROM items i
-                   LEFT JOIN projects p ON p.id = i.project_id
-                   LEFT JOIN files f ON f.id = i.source_file_id
-                   LEFT JOIN item_tags it ON it.item_id = i.id
-                   LEFT JOIN tags t ON t.id = it.tag_id
-                   WHERE (?1 IS NULL OR i.occur_date >= ?1)
-                     AND (?2 IS NULL OR i.occur_date <= ?2)
-                   GROUP BY i.id
-                   ORDER BY i.occur_date DESC";
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = format!(
+            "SELECT {SEARCH_COLS}
+             FROM items i
+             {SEARCH_JOINS}
+             WHERE (?1 IS NULL OR i.occur_date >= ?1)
+               AND (?2 IS NULL OR i.occur_date <= ?2)
+             GROUP BY i.id
+             ORDER BY i.occur_date DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![date_from, date_to], map_search_row)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -452,6 +372,9 @@ impl Database {
 
         let mut tables = Vec::with_capacity(table_names.len());
         for name in &table_names {
+            if !is_valid_identifier(name) {
+                continue;
+            }
             let count: i64 = self.conn.query_row(
                 &format!("SELECT COUNT(*) FROM \"{}\"", name),
                 [],
@@ -502,6 +425,9 @@ impl Database {
 
     /// 从指定路径导入数据库（恢复），覆盖现有全部数据。
     pub fn import_data(&mut self, source_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if source_path.contains('\0') {
+            return Err("数据库路径包含非法字符".into());
+        }
         let escaped = source_path.replace('\'', "''");
         self.conn.execute(
             &format!("ATTACH DATABASE '{}' AS src", escaped),
@@ -540,6 +466,17 @@ impl Database {
         Ok(results)
     }
 
+    /// 按路径查文件是否已登记（供文件夹扫描用）。
+    pub fn find_file_by_path(&self, path: &str) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT id FROM files WHERE path = ?1",
+                params![path],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+    }
+
     /// 检查条目是否疑似重复（标题 + 日期相同）。
     pub fn check_item_duplicate(
         &self,
@@ -561,11 +498,6 @@ impl Database {
         Ok(count > 0)
     }
 }
-
-const SUPPORTED_EXTS: &[&str] = &[
-    "pdf", "docx", "xlsx", "pptx", "doc", "xls", "ppt",
-    "txt", "csv", "md", "html", "htm", "rtf", "wps", "et", "dps",
-];
 
 fn scan_dir_recursive(
     dir: &str,
@@ -595,11 +527,7 @@ fn scan_dir_recursive(
         let filename = entry.file_name().to_string_lossy().to_string();
         let size = entry.metadata().ok().map(|m| m.len() as i64);
 
-        // 按路径查重
-        let mut stmt = db.conn.prepare("SELECT id FROM files WHERE path = ?1")?;
-        let existing_id = stmt
-            .query_row(params![&path_str], |row| row.get::<_, i64>(0))
-            .ok();
+        let existing_id = db.find_file_by_path(&path_str);
 
         results.push(ScannedFile {
             path: path_str,
@@ -627,6 +555,14 @@ fn compute_file_hash(path: &str) -> Option<String> {
         hasher.update(&buf[..n]);
     }
     Some(format!("{:x}", hasher.finalize()))
+}
+
+/// 校验标识符是否安全（仅允许字母、数字、下划线、中文）。
+fn is_valid_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || (c >= '\u{4e00}' && c <= '\u{9fff}'))
 }
 
 fn now_unix() -> i64 {
